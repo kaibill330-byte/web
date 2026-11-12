@@ -667,6 +667,57 @@ try {
     } catch (e) {
         console.error("Failed to auto-remove Sem 3 student data:", e);
     }
+
+    // =============================================
+    // EXAM MODULE — Table Migrations
+    // =============================================
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS exam_configs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            subject TEXT DEFAULT '',
+            program TEXT NOT NULL,
+            semester TEXT NOT NULL,
+            total_questions INTEGER DEFAULT 0,
+            questions_to_show INTEGER DEFAULT 15,
+            duration_seconds INTEGER DEFAULT 1800,
+            status TEXT DEFAULT 'draft',
+            created_by INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS exam_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER NOT NULL,
+            question_text TEXT NOT NULL,
+            option_a TEXT NOT NULL,
+            option_b TEXT NOT NULL,
+            option_c TEXT NOT NULL,
+            option_d TEXT NOT NULL,
+            correct_answer TEXT NOT NULL,
+            FOREIGN KEY(exam_id) REFERENCES exam_configs(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS exam_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER NOT NULL,
+            student_id INTEGER NOT NULL,
+            assigned_question_ids TEXT DEFAULT '[]',
+            answers TEXT DEFAULT '{}',
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            submitted_at DATETIME,
+            score INTEGER DEFAULT 0,
+            total INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'in_progress',
+            time_remaining_seconds INTEGER DEFAULT 1800,
+            last_heartbeat DATETIME DEFAULT CURRENT_TIMESTAMP,
+            auto_submitted INTEGER DEFAULT 0,
+            UNIQUE(exam_id, student_id),
+            FOREIGN KEY(exam_id) REFERENCES exam_configs(id) ON DELETE CASCADE,
+            FOREIGN KEY(student_id) REFERENCES users(id)
+        );
+    `);
+    console.log('Exam module tables ready.');
 }
 
 // --- HELPER FUNCTIONS ---
@@ -3577,7 +3628,336 @@ app.get('*', (req, res) => {
 
 
 
+// =============================================
+// EXAM MODULE — API ROUTES
+// =============================================
+
+// Helper: Fisher-Yates shuffle
+function shuffleArray(arr) {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+// GET /api/exams — list exams (admin: all; student: matching their program+semester)
+app.get('/api/exams', (req, res) => {
+    try {
+        const { program, semester, role } = req.query;
+        let rows;
+        if (role === 'admin' || role === 'teacher') {
+            rows = db.prepare('SELECT ec.*, (SELECT COUNT(*) FROM exam_questions WHERE exam_id=ec.id) as question_count FROM exam_configs ec ORDER BY ec.created_at DESC').all();
+        } else {
+            rows = db.prepare(`
+                SELECT ec.*, (SELECT COUNT(*) FROM exam_questions WHERE exam_id=ec.id) as question_count
+                FROM exam_configs ec
+                WHERE ec.program = ? AND ec.semester = ? AND ec.status IN ('active','closed')
+                ORDER BY ec.created_at DESC
+            `).all(program || '', semester || '');
+        }
+        res.json({ success: true, exams: rows });
+    } catch (err) {
+        console.error('GET /api/exams error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// POST /api/exams — create a new exam config (admin only)
+app.post('/api/exams', (req, res) => {
+    try {
+        const { title, subject, program, semester, questions_to_show, duration_seconds, created_by } = req.body;
+        if (!title || !program || !semester) return res.status(400).json({ error: 'title, program, semester required.' });
+        const stmt = db.prepare(`
+            INSERT INTO exam_configs (title, subject, program, semester, questions_to_show, duration_seconds, created_by, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')
+        `);
+        const result = stmt.run(title, subject || '', program, semester, questions_to_show || 15, duration_seconds || 1800, created_by || null);
+        dbChanged = true;
+        res.json({ success: true, exam_id: result.lastInsertRowid });
+    } catch (err) {
+        console.error('POST /api/exams error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// PUT /api/exams/:id — update exam config (questions_to_show, duration, title)
+app.put('/api/exams/:id', (req, res) => {
+    try {
+        const { title, subject, questions_to_show, duration_seconds } = req.body;
+        db.prepare(`UPDATE exam_configs SET title=COALESCE(?,title), subject=COALESCE(?,subject), questions_to_show=COALESCE(?,questions_to_show), duration_seconds=COALESCE(?,duration_seconds) WHERE id=?`)
+          .run(title || null, subject || null, questions_to_show || null, duration_seconds || null, req.params.id);
+        dbChanged = true;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PUT /api/exams/:id error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// PUT /api/exams/:id/status — start (active) or stop (closed) exam
+app.put('/api/exams/:id/status', (req, res) => {
+    try {
+        const { status } = req.body;
+        if (!['draft', 'active', 'closed'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+        db.prepare('UPDATE exam_configs SET status=? WHERE id=?').run(status, req.params.id);
+        dbChanged = true;
+        res.json({ success: true, status });
+    } catch (err) {
+        console.error('PUT /api/exams/:id/status error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// DELETE /api/exams/:id — delete exam and all questions/sessions
+app.delete('/api/exams/:id', (req, res) => {
+    try {
+        db.prepare('DELETE FROM exam_sessions WHERE exam_id=?').run(req.params.id);
+        db.prepare('DELETE FROM exam_questions WHERE exam_id=?').run(req.params.id);
+        db.prepare('DELETE FROM exam_configs WHERE id=?').run(req.params.id);
+        dbChanged = true;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/exams/:id error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// POST /api/exams/:id/questions — bulk upload questions (JSON array from parsed Excel)
+app.post('/api/exams/:id/questions', (req, res) => {
+    try {
+        const { questions, replace } = req.body;
+        if (!Array.isArray(questions) || questions.length === 0) return res.status(400).json({ error: 'Questions array is required.' });
+
+        const examId = req.params.id;
+        const exam = db.prepare('SELECT * FROM exam_configs WHERE id=?').get(examId);
+        if (!exam) return res.status(404).json({ error: 'Exam not found.' });
+
+        // If replace=true, clear existing questions first
+        if (replace) {
+            db.prepare('DELETE FROM exam_questions WHERE exam_id=?').run(examId);
+        }
+
+        const insertStmt = db.prepare(`
+            INSERT INTO exam_questions (exam_id, question_text, option_a, option_b, option_c, option_d, correct_answer)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+        db.exec('BEGIN TRANSACTION;');
+        let count = 0;
+        for (const q of questions) {
+            if (!q.question_text || !q.option_a || !q.option_b || !q.option_c || !q.option_d || !q.correct_answer) continue;
+            insertStmt.run(examId, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_answer.toUpperCase().trim());
+            count++;
+        }
+        // Update total_questions count
+        db.prepare('UPDATE exam_configs SET total_questions=(SELECT COUNT(*) FROM exam_questions WHERE exam_id=?) WHERE id=?').run(examId, examId);
+        db.exec('COMMIT;');
+        dbChanged = true;
+        res.json({ success: true, inserted: count });
+    } catch (err) {
+        try { db.exec('ROLLBACK;'); } catch(_) {}
+        console.error('POST /api/exams/:id/questions error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// GET /api/exams/:id/questions — get all questions (admin only, with correct answers)
+app.get('/api/exams/:id/questions', (req, res) => {
+    try {
+        const rows = db.prepare('SELECT * FROM exam_questions WHERE exam_id=? ORDER BY id ASC').all(req.params.id);
+        res.json({ success: true, questions: rows });
+    } catch (err) {
+        console.error('GET /api/exams/:id/questions error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// GET /api/exams/:id/results — get all student results (admin/teacher)
+app.get('/api/exams/:id/results', (req, res) => {
+    try {
+        const rows = db.prepare(`
+            SELECT es.*, u.name as student_name, u.username as roll_number, u.division, u.semester
+            FROM exam_sessions es
+            JOIN users u ON es.student_id = u.id
+            WHERE es.exam_id = ?
+            ORDER BY es.score DESC, es.submitted_at ASC
+        `).all(req.params.id);
+        res.json({ success: true, results: rows });
+    } catch (err) {
+        console.error('GET /api/exams/:id/results error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// GET /api/exam-sessions/my?student_id=&exam_id= — get active/completed session for student
+app.get('/api/exam-sessions/my', (req, res) => {
+    try {
+        const { student_id, exam_id } = req.query;
+        if (!student_id) return res.status(400).json({ error: 'student_id required.' });
+        let session;
+        if (exam_id) {
+            session = db.prepare('SELECT * FROM exam_sessions WHERE student_id=? AND exam_id=?').get(student_id, exam_id);
+        } else {
+            // Get the most recent non-submitted session
+            session = db.prepare(`
+                SELECT es.* FROM exam_sessions es
+                JOIN exam_configs ec ON es.exam_id = ec.id
+                WHERE es.student_id=? AND es.status='in_progress' AND ec.status='active'
+                ORDER BY es.started_at DESC LIMIT 1
+            `).get(student_id);
+        }
+        res.json({ success: true, session: session || null });
+    } catch (err) {
+        console.error('GET /api/exam-sessions/my error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// POST /api/exam-sessions/start — start or resume exam session
+app.post('/api/exam-sessions/start', (req, res) => {
+    try {
+        const { exam_id, student_id } = req.body;
+        if (!exam_id || !student_id) return res.status(400).json({ error: 'exam_id and student_id required.' });
+
+        const exam = db.prepare('SELECT * FROM exam_configs WHERE id=?').get(exam_id);
+        if (!exam) return res.status(404).json({ error: 'Exam not found.' });
+        if (exam.status !== 'active') return res.status(403).json({ error: 'Exam is not currently active.' });
+
+        // Check for existing session
+        const existing = db.prepare('SELECT * FROM exam_sessions WHERE exam_id=? AND student_id=?').get(exam_id, student_id);
+        if (existing) {
+            if (existing.status !== 'in_progress') {
+                return res.json({ success: true, session: existing, resumed: false, already_submitted: true });
+            }
+            // Resume: get the assigned questions (without correct answers)
+            const qIds = JSON.parse(existing.assigned_question_ids || '[]');
+            const questions = qIds.map(qid => {
+                const q = db.prepare('SELECT id, question_text, option_a, option_b, option_c, option_d FROM exam_questions WHERE id=?').get(qid);
+                return q;
+            }).filter(Boolean);
+            return res.json({ success: true, session: existing, questions, resumed: true });
+        }
+
+        // New session: pick random questions
+        const allQuestions = db.prepare('SELECT id FROM exam_questions WHERE exam_id=?').all(exam_id);
+        if (allQuestions.length === 0) return res.status(400).json({ error: 'No questions uploaded for this exam.' });
+
+        const count = Math.min(exam.questions_to_show, allQuestions.length);
+        const selectedIds = shuffleArray(allQuestions.map(q => q.id)).slice(0, count);
+
+        const insertStmt = db.prepare(`
+            INSERT INTO exam_sessions (exam_id, student_id, assigned_question_ids, answers, time_remaining_seconds, status)
+            VALUES (?, ?, ?, '{}', ?, 'in_progress')
+        `);
+        const result = insertStmt.run(exam_id, student_id, JSON.stringify(selectedIds), exam.duration_seconds);
+        const sessionId = result.lastInsertRowid;
+
+        const questions = selectedIds.map(qid => {
+            return db.prepare('SELECT id, question_text, option_a, option_b, option_c, option_d FROM exam_questions WHERE id=?').get(qid);
+        }).filter(Boolean);
+
+        const session = db.prepare('SELECT * FROM exam_sessions WHERE id=?').get(sessionId);
+        dbChanged = true;
+        res.json({ success: true, session, questions, resumed: false });
+    } catch (err) {
+        console.error('POST /api/exam-sessions/start error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// PUT /api/exam-sessions/:id/answer — save answer & update time remaining (heartbeat)
+app.put('/api/exam-sessions/:id/answer', (req, res) => {
+    try {
+        const { question_id, chosen_option, time_remaining_seconds } = req.body;
+        const session = db.prepare('SELECT * FROM exam_sessions WHERE id=?').get(req.params.id);
+        if (!session || session.status !== 'in_progress') return res.status(400).json({ error: 'Session not active.' });
+
+        const answers = JSON.parse(session.answers || '{}');
+        if (question_id !== undefined && chosen_option !== undefined) {
+            answers[question_id] = chosen_option;
+        }
+        db.prepare(`
+            UPDATE exam_sessions SET answers=?, time_remaining_seconds=COALESCE(?,time_remaining_seconds), last_heartbeat=CURRENT_TIMESTAMP WHERE id=?
+        `).run(JSON.stringify(answers), time_remaining_seconds !== undefined ? time_remaining_seconds : null, req.params.id);
+        dbChanged = true;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PUT /api/exam-sessions/:id/answer error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// PUT /api/exam-sessions/:id/submit — submit exam, calculate score
+app.put('/api/exam-sessions/:id/submit', (req, res) => {
+    try {
+        const { auto_submitted } = req.body;
+        const session = db.prepare('SELECT * FROM exam_sessions WHERE id=?').get(req.params.id);
+        if (!session) return res.status(404).json({ error: 'Session not found.' });
+        if (session.status !== 'in_progress') {
+            // Already submitted — return existing result with question breakdown
+            const breakdown = buildBreakdown(session);
+            return res.json({ success: true, score: session.score, total: session.total, breakdown, already_submitted: true });
+        }
+
+        const answers = JSON.parse(session.answers || '{}');
+        const qIds = JSON.parse(session.assigned_question_ids || '[]');
+        const allQ = db.prepare(`SELECT id, correct_answer FROM exam_questions WHERE id IN (${qIds.map(() => '?').join(',') || '0'})`).all(...qIds);
+        
+        let score = 0;
+        const qMap = {};
+        allQ.forEach(q => { qMap[q.id] = q.correct_answer; });
+        qIds.forEach(qid => {
+            if (answers[qid] && answers[qid].toUpperCase() === (qMap[qid] || '').toUpperCase()) {
+                score++;
+            }
+        });
+
+        db.prepare(`
+            UPDATE exam_sessions SET status='submitted', submitted_at=CURRENT_TIMESTAMP, score=?, total=?, auto_submitted=? WHERE id=?
+        `).run(score, qIds.length, auto_submitted ? 1 : 0, req.params.id);
+        dbChanged = true;
+
+        const updatedSession = db.prepare('SELECT * FROM exam_sessions WHERE id=?').get(req.params.id);
+        const breakdown = buildBreakdown(updatedSession);
+        res.json({ success: true, score, total: qIds.length, breakdown });
+    } catch (err) {
+        console.error('PUT /api/exam-sessions/:id/submit error:', err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+function buildBreakdown(session) {
+    try {
+        const qIds = JSON.parse(session.assigned_question_ids || '[]');
+        const answers = JSON.parse(session.answers || '{}');
+        if (qIds.length === 0) return [];
+        const questions = db.prepare(`SELECT * FROM exam_questions WHERE id IN (${qIds.map(() => '?').join(',') || '0'})`).all(...qIds);
+        const qMap = {};
+        questions.forEach(q => { qMap[q.id] = q; });
+        return qIds.map((qid, idx) => {
+            const q = qMap[qid];
+            if (!q) return null;
+            const chosen = answers[qid] || null;
+            return {
+                index: idx + 1,
+                question_text: q.question_text,
+                option_a: q.option_a,
+                option_b: q.option_b,
+                option_c: q.option_c,
+                option_d: q.option_d,
+                correct_answer: q.correct_answer,
+                chosen_answer: chosen,
+                is_correct: chosen && chosen.toUpperCase() === q.correct_answer.toUpperCase()
+            };
+        }).filter(Boolean);
+    } catch (e) {
+        return [];
+    }
+}
+
 // Periodic database upload to MongoDB Atlas
+
 setInterval(async () => {
     if (dbChanged) {
         dbChanged = false;

@@ -386,6 +386,7 @@ const ROLE_NAV = {
         { id: "dashboard", label: "Overview", icon: "fa-chart-pie" },
         { id: "timetable", label: "Class Timetable", icon: "fa-calendar-days" },
         { id: "attendance", label: "Attendance Record", icon: "fa-calendar-check" },
+        { id: "exam", label: "Exam", icon: "fa-file-pen" },
         { id: "syllabus", label: "Syllabus & Courses", icon: "fa-book-open" },
         { id: "assignments", label: "Assignments", icon: "fa-pen-to-square" },
         { id: "study_materials", label: "Study Materials", icon: "fa-book" },
@@ -403,6 +404,7 @@ const ROLE_NAV = {
         { id: "lecture_attendance", label: "Lecture Wise Sheet", icon: "fa-list-check" },
         { id: "lecture_history", label: "Manage Taken Lectures", icon: "fa-clock-rotate-left" },
         { id: "coursework_manager", label: "Coursework Suite", icon: "fa-folder-open" },
+        { id: "exam", label: "Exam Results", icon: "fa-file-pen" },
         { id: "profile", label: "Profile Settings", icon: "fa-user-gear" }
     ],
     admin: [
@@ -417,6 +419,7 @@ const ROLE_NAV = {
         { id: "lecture_attendance", label: "Lecture Wise Sheet", icon: "fa-list-check" },
         { id: "admin_lectures", label: "Teacher Lectures Report", icon: "fa-chalkboard-user" },
         { id: "coursework_manager", label: "Coursework Suite", icon: "fa-folder-open" },
+        { id: "exam", label: "Exam Manager", icon: "fa-file-pen" },
         { id: "database", label: "Postgres Console", icon: "fa-database" },
         { id: "profile", label: "Profile Settings", icon: "fa-user-gear" }
     ]
@@ -7844,3 +7847,619 @@ window.showOfflineAttendanceImporter = async function() {
     }
 };
 
+
+// =============================================
+// EXAM MODULE — RENDER FUNCTIONS
+// =============================================
+
+// ---- Shared state for active exam ----
+let examTimerInterval = null;
+let activeExamSession = null;
+let activeExamQuestions = [];
+let activeExamCurrentQ = 0;
+let activeExamAnswers = {};
+let examAutoSubmitLocked = false;
+
+function formatExamTime(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+function stopExamTimer() {
+    if (examTimerInterval) { clearInterval(examTimerInterval); examTimerInterval = null; }
+}
+
+// AUTO-SUBMIT on tab switch / minimize
+document.addEventListener('visibilitychange', async () => {
+    if (document.hidden && activeExamSession && activeExamSession.status === 'in_progress' && !examAutoSubmitLocked) {
+        examAutoSubmitLocked = true;
+        stopExamTimer();
+        try {
+            await fetch(`/api/exam-sessions/${activeExamSession.id}/submit`, {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ auto_submitted: true })
+            });
+            activeExamSession.status = 'submitted';
+        } catch(e) {}
+    }
+});
+
+// =============================================
+// ADMIN — Exam Manager
+// =============================================
+window.renderAdminExam = async function() {
+    dynamicContentArea.innerHTML = `<div class="text-center" style="padding:50px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:32px;color:var(--primary);"></i></div>`;
+    try {
+        const res = await fetch('/api/exams?role=admin');
+        const data = await res.json();
+        const exams = data.exams || [];
+
+        dynamicContentArea.innerHTML = `
+        <div class="glass-card mb-24">
+            <div class="card-header-flex mb-20">
+                <h3 class="card-title"><i class="fa-solid fa-file-pen mr-8" style="color:var(--primary);"></i>Exam Manager</h3>
+                <button class="btn btn-primary" id="admin-create-exam-btn">
+                    <i class="fa-solid fa-plus"></i><span>New Exam</span>
+                </button>
+            </div>
+            <div id="admin-exam-create-form" style="display:none;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:14px;padding:20px;margin-bottom:24px;">
+                <h4 style="margin-bottom:16px;">New Exam Configuration</h4>
+                <div class="form-grid" style="margin-bottom:12px;">
+                    <div class="form-group"><label>Exam Title</label><input type="text" id="exam-new-title" class="form-control" placeholder="e.g. Unit Test 1 — Accountancy"></div>
+                    <div class="form-group"><label>Subject</label><input type="text" id="exam-new-subject" class="form-control" placeholder="e.g. Financial Accounting"></div>
+                </div>
+                <div class="form-grid" style="margin-bottom:12px;">
+                    <div class="form-group"><label>Program</label>
+                        <select id="exam-new-program" class="form-control">
+                            <option value="B.Com (Regular)">B.Com (Regular)</option>
+                            <option value="B.Com (Professional)">B.Com (Professional)</option>
+                            <option value="M.Com">M.Com</option>
+                        </select>
+                    </div>
+                    <div class="form-group"><label>Semester</label>
+                        <select id="exam-new-semester" class="form-control">
+                            <option value="Semester 1">Semester 1</option><option value="Semester 2">Semester 2</option>
+                            <option value="Semester 3">Semester 3</option><option value="Semester 4">Semester 4</option>
+                            <option value="Semester 5">Semester 5</option><option value="Semester 6">Semester 6</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-grid" style="margin-bottom:16px;">
+                    <div class="form-group"><label>Questions to Show per Student</label><input type="number" id="exam-new-qcount" class="form-control" value="15" min="1"></div>
+                    <div class="form-group"><label>Duration (minutes)</label><input type="number" id="exam-new-duration" class="form-control" value="30" min="1"></div>
+                </div>
+                <div style="display:flex;gap:12px;">
+                    <button class="btn btn-primary" id="admin-exam-save-btn"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                    <button class="btn btn-secondary" id="admin-exam-cancel-btn">Cancel</button>
+                </div>
+            </div>
+            <div id="admin-exam-list">
+                ${exams.length === 0 ? `<p style="color:var(--text-muted);text-align:center;padding:24px;">No exams yet. Click <strong>New Exam</strong> to begin.</p>` :
+                  exams.map(e => adminExamCardHTML(e)).join('')}
+            </div>
+        </div>`;
+
+        document.getElementById('admin-create-exam-btn').onclick = () => {
+            const f = document.getElementById('admin-exam-create-form');
+            f.style.display = f.style.display === 'none' ? 'block' : 'none';
+        };
+        document.getElementById('admin-exam-cancel-btn').onclick = () => {
+            document.getElementById('admin-exam-create-form').style.display = 'none';
+        };
+        document.getElementById('admin-exam-save-btn').onclick = async () => {
+            const title = document.getElementById('exam-new-title').value.trim();
+            const subject = document.getElementById('exam-new-subject').value.trim();
+            const program = document.getElementById('exam-new-program').value;
+            const semester = document.getElementById('exam-new-semester').value;
+            const qcount = parseInt(document.getElementById('exam-new-qcount').value) || 15;
+            const dur = parseInt(document.getElementById('exam-new-duration').value) || 30;
+            if (!title) { alert('Please enter an exam title.'); return; }
+            const btn = document.getElementById('admin-exam-save-btn');
+            btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+            const r = await fetch('/api/exams', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title, subject, program, semester, questions_to_show: qcount, duration_seconds: dur * 60, created_by: currentUser.id })
+            });
+            const d = await r.json();
+            if (d.success) window.renderAdminExam();
+            else { alert(d.error || 'Failed.'); btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save'; }
+        };
+
+        document.getElementById('admin-exam-list').addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            const eid = btn.dataset.examId;
+            const action = btn.dataset.action;
+            if (action === 'start') adminExamSetStatus(eid, 'active');
+            else if (action === 'stop') adminExamSetStatus(eid, 'closed');
+            else if (action === 'draft') adminExamSetStatus(eid, 'draft');
+            else if (action === 'delete') adminExamDelete(eid);
+            else if (action === 'upload') adminExamOpenUpload(eid, btn.dataset.examTitle);
+            else if (action === 'results') adminExamViewResults(eid, btn.dataset.examTitle);
+        });
+    } catch(err) {
+        console.error(err);
+        dynamicContentArea.innerHTML = `<div class="glass-card"><p style="color:var(--danger);">Failed to load exams.</p></div>`;
+    }
+};
+
+function adminExamCardHTML(e) {
+    const sc = e.status === 'active' ? 'var(--success)' : e.status === 'closed' ? 'var(--danger)' : 'var(--text-muted)';
+    const sl = e.status === 'active' ? '🟢 LIVE' : e.status === 'closed' ? '🔴 Closed' : '⚪ Draft';
+    const dm = Math.round(e.duration_seconds / 60);
+    return `<div class="exam-admin-card" style="border-left:4px solid ${sc};">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">
+            <div>
+                <div style="font-size:16px;font-weight:700;">${e.title}</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">${e.program} &bull; ${e.semester}${e.subject ? ' &bull; '+e.subject : ''}</div>
+                <div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;">
+                    <span class="exam-pill"><i class="fa-solid fa-list-ol"></i> ${e.question_count||0} in pool</span>
+                    <span class="exam-pill"><i class="fa-solid fa-dice"></i> ${e.questions_to_show} shown</span>
+                    <span class="exam-pill"><i class="fa-solid fa-clock"></i> ${dm}min</span>
+                    <span class="exam-pill" style="color:${sc};background:${sc}1a;">${sl}</span>
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                ${e.status!=='active'?`<button class="btn btn-primary exam-action-btn" data-action="start" data-exam-id="${e.id}"><i class="fa-solid fa-play"></i> Start</button>`:''}
+                ${e.status==='active'?`<button class="btn btn-secondary exam-action-btn" data-action="stop" data-exam-id="${e.id}"><i class="fa-solid fa-stop"></i> Stop</button>`:''}
+                ${e.status==='closed'?`<button class="btn btn-secondary exam-action-btn" style="font-size:12px;" data-action="draft" data-exam-id="${e.id}"><i class="fa-solid fa-rotate-left"></i> Reopen</button>`:''}
+                <button class="btn" style="background:rgba(20,184,166,.1);color:var(--accent);border:1px solid rgba(20,184,166,.3);padding:8px 14px;border-radius:8px;font-size:13px;cursor:pointer;" data-action="upload" data-exam-id="${e.id}" data-exam-title="${e.title}"><i class="fa-solid fa-file-excel"></i> Questions</button>
+                <button class="btn" style="background:rgba(37,99,235,.08);color:var(--primary);border:1px solid rgba(37,99,235,.2);padding:8px 14px;border-radius:8px;font-size:13px;cursor:pointer;" data-action="results" data-exam-id="${e.id}" data-exam-title="${e.title}"><i class="fa-solid fa-chart-bar"></i> Results</button>
+                <button class="btn" style="background:rgba(239,68,68,.07);color:var(--danger);border:1px solid rgba(239,68,68,.15);padding:8px 14px;border-radius:8px;font-size:13px;cursor:pointer;" data-action="delete" data-exam-id="${e.id}"><i class="fa-solid fa-trash"></i></button>
+            </div>
+        </div>
+    </div>`;
+}
+
+async function adminExamSetStatus(examId, status) {
+    if (!confirm(`${status==='active'?'Start':'status'==='closed'?'Stop':'Reset'} this exam?`)) return;
+    await fetch(`/api/exams/${examId}/status`, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({status}) });
+    window.renderAdminExam();
+}
+async function adminExamDelete(examId) {
+    if (!confirm('Delete this exam and ALL its data permanently?')) return;
+    await fetch(`/api/exams/${examId}`, { method:'DELETE' });
+    window.renderAdminExam();
+}
+
+function adminExamOpenUpload(examId, examTitle) {
+    generalModalTitle.textContent = `Upload Questions — ${examTitle}`;
+    generalModalBody.innerHTML = `
+    <div style="background:rgba(20,184,166,.08);border:1px solid rgba(20,184,166,.2);border-radius:10px;padding:14px;margin-bottom:16px;">
+        <div style="font-weight:600;color:var(--accent);margin-bottom:6px;"><i class="fa-solid fa-circle-info"></i> Required Excel Columns (Row 1 = headers)</div>
+        <div style="font-size:12px;color:var(--text-muted);font-family:monospace;background:var(--bg-primary);padding:8px;border-radius:6px;">Question | Option A | Option B | Option C | Option D | Correct Answer</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Correct Answer = A, B, C, or D</div>
+    </div>
+    <label style="font-weight:600;display:block;margin-bottom:8px;">Select Excel File (.xlsx / .xls)</label>
+    <input type="file" id="exam-excel-file" accept=".xlsx,.xls" class="form-control" style="padding:10px;">
+    <div id="exam-upload-preview" style="margin-top:16px;"></div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;margin:12px 0;">
+        <input type="checkbox" id="exam-replace-chk" checked style="width:16px;height:16px;"> Replace existing questions
+    </label>
+    <button class="btn btn-primary" id="exam-upload-submit-btn" disabled style="width:100%;">
+        <i class="fa-solid fa-cloud-arrow-up"></i> Upload to Exam
+    </button>`;
+    generalModal.classList.add('active');
+
+    document.getElementById('exam-excel-file').addEventListener('change', (ev) => {
+        const file = ev.target.files[0]; if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (et) => {
+            try {
+                const wb = XLSX.read(et.target.result, { type:'binary' });
+                const ws = wb.Sheets[wb.SheetNames[0]];
+                const rows = XLSX.utils.sheet_to_json(ws, { header:1 });
+                const dataRows = rows.slice(1).filter(r => r.length >= 6 && r[0]);
+                const preview = dataRows.slice(0,5);
+                document.getElementById('exam-upload-preview').innerHTML = `
+                <div style="font-size:13px;color:var(--text-muted);margin-bottom:8px;">Preview (first ${preview.length} of ${dataRows.length} questions):</div>
+                ${preview.map((r,i)=>`<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:8px;padding:10px;margin-bottom:8px;">
+                    <div style="font-weight:600;font-size:13px;margin-bottom:4px;">Q${i+1}. ${r[0]}</div>
+                    <div style="font-size:11px;color:var(--text-muted);">A: ${r[1]} &bull; B: ${r[2]} &bull; C: ${r[3]} &bull; D: ${r[4]} &bull; ✅ ${r[5]}</div>
+                </div>`).join('')}
+                <div style="font-size:12px;color:var(--success);font-weight:600;margin-top:8px;"><i class="fa-solid fa-circle-check"></i> ${dataRows.length} questions ready</div>`;
+                const btn = document.getElementById('exam-upload-submit-btn');
+                btn.disabled = dataRows.length === 0;
+                btn.dataset.rows = JSON.stringify(dataRows);
+            } catch(e) { document.getElementById('exam-upload-preview').innerHTML = `<div style="color:var(--danger);">Failed to parse file.</div>`; }
+        };
+        reader.readAsBinaryString(file);
+    });
+
+    document.getElementById('exam-upload-submit-btn').addEventListener('click', async () => {
+        const btn = document.getElementById('exam-upload-submit-btn');
+        const rawRows = JSON.parse(btn.dataset.rows||'[]');
+        const replace = document.getElementById('exam-replace-chk').checked;
+        const questions = rawRows.map(r=>({
+            question_text: String(r[0]||'').trim(), option_a: String(r[1]||'').trim(),
+            option_b: String(r[2]||'').trim(), option_c: String(r[3]||'').trim(),
+            option_d: String(r[4]||'').trim(), correct_answer: String(r[5]||'').trim().toUpperCase()
+        })).filter(q=>q.question_text && ['A','B','C','D'].includes(q.correct_answer));
+        btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading...';
+        try {
+            const r = await fetch(`/api/exams/${examId}/questions`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({questions,replace}) });
+            const d = await r.json();
+            if (d.success) { generalModal.classList.remove('active'); alert(`✅ Uploaded ${d.inserted} questions!`); window.renderAdminExam(); }
+            else { alert(d.error||'Upload failed.'); btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-cloud-arrow-up"></i> Upload to Exam'; }
+        } catch(e) { alert('Network error.'); btn.disabled=false; btn.innerHTML='<i class="fa-solid fa-cloud-arrow-up"></i> Upload to Exam'; }
+    });
+}
+
+async function adminExamViewResults(examId, examTitle) {
+    generalModalTitle.textContent = `Results — ${examTitle}`;
+    generalModalBody.innerHTML = `<div class="text-center" style="padding:30px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:28px;color:var(--primary);"></i></div>`;
+    generalModal.classList.add('active');
+    try {
+        const r = await fetch(`/api/exams/${examId}/results`);
+        const d = await r.json();
+        const results = d.results || [];
+        if (!results.length) { generalModalBody.innerHTML = `<p style="color:var(--text-muted);text-align:center;padding:24px;">No submissions yet.</p>`; return; }
+        const avg = (results.reduce((s,r)=>s+(r.total>0?r.score/r.total:0),0)/results.length*100).toFixed(1);
+        generalModalBody.innerHTML = `
+        <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
+            <div class="exam-stat-mini"><i class="fa-solid fa-users"></i> ${results.length} Submitted</div>
+            <div class="exam-stat-mini" style="color:var(--accent);"><i class="fa-solid fa-chart-line"></i> Avg: ${avg}%</div>
+            <div class="exam-stat-mini" style="color:var(--success);"><i class="fa-solid fa-trophy"></i> Top: ${results[0].score}/${results[0].total}</div>
+        </div>
+        <div style="max-height:420px;overflow-y:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead><tr style="background:var(--bg-secondary);">
+                <th style="padding:10px 12px;text-align:left;border-bottom:1px solid var(--border-color);">#</th>
+                <th style="padding:10px 12px;text-align:left;border-bottom:1px solid var(--border-color);">Student</th>
+                <th style="padding:10px 12px;text-align:left;border-bottom:1px solid var(--border-color);">Roll No</th>
+                <th style="padding:10px 12px;text-align:left;border-bottom:1px solid var(--border-color);">Div</th>
+                <th style="padding:10px 12px;text-align:center;border-bottom:1px solid var(--border-color);">Score</th>
+                <th style="padding:10px 12px;text-align:center;border-bottom:1px solid var(--border-color);">%</th>
+                <th style="padding:10px 12px;text-align:center;border-bottom:1px solid var(--border-color);">Status</th>
+            </tr></thead>
+            <tbody>${results.map((r,i)=>{
+                const pct = r.total>0?Math.round(r.score/r.total*100):0;
+                const pc = pct>=75?'var(--success)':pct>=50?'var(--warning)':'var(--danger)';
+                return `<tr style="border-bottom:1px solid var(--border-color);">
+                    <td style="padding:10px 12px;color:var(--text-muted);">${i+1}</td>
+                    <td style="padding:10px 12px;font-weight:600;">${r.student_name}</td>
+                    <td style="padding:10px 12px;color:var(--text-muted);">${r.roll_number}</td>
+                    <td style="padding:10px 12px;color:var(--text-muted);">${r.division||'-'}</td>
+                    <td style="padding:10px 12px;text-align:center;font-weight:700;color:${pc};">${r.score}/${r.total}</td>
+                    <td style="padding:10px 12px;text-align:center;font-weight:700;color:${pc};">${pct}%</td>
+                    <td style="padding:10px 12px;text-align:center;">${r.auto_submitted?
+                        '<span style="font-size:11px;background:rgba(239,68,68,.1);color:var(--danger);padding:2px 8px;border-radius:20px;">Auto-submitted</span>':
+                        '<span style="font-size:11px;background:rgba(16,185,129,.1);color:var(--success);padding:2px 8px;border-radius:20px;">Submitted</span>'}</td>
+                </tr>`;
+            }).join('')}</tbody>
+        </table></div>
+        <button class="btn btn-secondary" id="exam-dl-csv" style="margin-top:16px;width:100%;"><i class="fa-solid fa-file-csv"></i> Download CSV</button>`;
+        document.getElementById('exam-dl-csv').onclick = () => {
+            const hdr = ['Rank','Student','Roll No','Division','Semester','Score','Total','%','Status'];
+            const rows2 = results.map((r,i)=>{const p=r.total>0?(r.score/r.total*100).toFixed(1):0;return[i+1,r.student_name,r.roll_number,r.division||'',r.semester||'',r.score,r.total,p+'%',r.auto_submitted?'Auto':'Submitted'];});
+            const csv = [hdr,...rows2].map(row=>row.map(v=>`"${v}"`).join(',')).join('\n');
+            const blob = new Blob([csv],{type:'text/csv'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href=url; a.download=`${(examTitle||'exam').replace(/\s+/g,'_')}_results.csv`; a.click(); URL.revokeObjectURL(url);
+        };
+    } catch(e) { generalModalBody.innerHTML=`<p style="color:var(--danger);">Failed to load results.</p>`; }
+}
+
+// =============================================
+// TEACHER — Exam (read-only)
+// =============================================
+window.renderTeacherExam = async function() {
+    dynamicContentArea.innerHTML = `<div class="text-center" style="padding:50px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:32px;color:var(--primary);"></i></div>`;
+    try {
+        const r = await fetch('/api/exams?role=teacher');
+        const d = await r.json();
+        const exams = d.exams || [];
+        dynamicContentArea.innerHTML = `<div class="glass-card">
+            <h3 class="card-title mb-20"><i class="fa-solid fa-file-pen mr-8" style="color:var(--primary);"></i>Exam Results</h3>
+            ${!exams.length ? `<p style="color:var(--text-muted);text-align:center;padding:24px;">No exams available.</p>` :
+            exams.map(e=>{const sc=e.status==='active'?'var(--success)':e.status==='closed'?'var(--danger)':'var(--text-muted)';
+            return `<div class="exam-admin-card" style="border-left:4px solid ${sc};">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+                    <div><div style="font-weight:700;font-size:15px;">${e.title}</div>
+                    <div style="font-size:12px;color:var(--text-muted);">${e.program} &bull; ${e.semester}</div></div>
+                    <button class="btn btn-primary" style="font-size:13px;" onclick="adminExamViewResults(${e.id},'${e.title.replace(/'/g,"\\'")}')">
+                        <i class="fa-solid fa-chart-bar"></i> Results
+                    </button>
+                </div></div>`;}).join('')}
+        </div>`;
+    } catch(e) { dynamicContentArea.innerHTML=`<div class="glass-card"><p style="color:var(--danger);">Failed to load.</p></div>`; }
+};
+
+// =============================================
+// STUDENT — Exam Portal
+// =============================================
+window.renderStudentExam = async function() {
+    stopExamTimer();
+    dynamicContentArea.innerHTML = `<div class="text-center" style="padding:50px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:32px;color:var(--primary);"></i></div>`;
+    try {
+        // Check for in-progress session (session resume on refresh/relogin)
+        const sr = await fetch(`/api/exam-sessions/my?student_id=${currentUser.id}`);
+        const sd = await sr.json();
+        if (sd.session) {
+            if (sd.session.status !== 'in_progress') { await showExamResults(sd.session.exam_id, sd.session.id, sd.session.auto_submitted); return; }
+            await startOrResumeExam(sd.session.exam_id, true); return;
+        }
+
+        const er = await fetch(`/api/exams?role=student&program=${encodeURIComponent(currentUser.program||'')}&semester=${encodeURIComponent(currentUser.semester||'')}`);
+        const ed = await er.json();
+        const exams = ed.exams || [];
+        const active = exams.filter(e=>e.status==='active');
+        const closed = exams.filter(e=>e.status==='closed');
+
+        dynamicContentArea.innerHTML = `
+        <div class="glass-card mb-20">
+            <h3 class="card-title mb-4"><i class="fa-solid fa-file-pen mr-8" style="color:var(--primary);"></i>Exam Portal</h3>
+            <p style="color:var(--text-muted);font-size:13px;margin-bottom:20px;">${currentUser.program||''} &bull; ${currentUser.semester||''}</p>
+            ${(!active.length && !closed.length) ? `<div style="text-align:center;padding:40px;">
+                <i class="fa-solid fa-clock" style="font-size:48px;color:var(--text-muted);opacity:.4;display:block;margin-bottom:16px;"></i>
+                <h3 style="color:var(--text-muted);">No Active Exams</h3>
+                <p style="color:var(--text-muted);font-size:13px;margin-top:8px;">Your teacher hasn't started any exam yet.</p>
+            </div>` : ''}
+            ${active.length ? `<div style="margin-bottom:24px;">
+                <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:var(--success);text-transform:uppercase;margin-bottom:12px;">
+                    <i class="fa-solid fa-circle fa-beat"></i> Live Exams
+                </div>
+                ${active.map(e=>`<div class="exam-student-card" style="border:2px solid rgba(16,185,129,.4);">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                        <div>
+                            <div style="font-weight:700;font-size:16px;">${e.title}</div>
+                            ${e.subject?`<div style="font-size:12px;color:var(--accent);margin-top:2px;">${e.subject}</div>`:''}
+                            <div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;">
+                                <span class="exam-pill"><i class="fa-solid fa-list-ol"></i> ${e.questions_to_show} Questions</span>
+                                <span class="exam-pill"><i class="fa-solid fa-clock"></i> ${Math.round(e.duration_seconds/60)}min</span>
+                                <span class="exam-pill" style="color:var(--success);background:rgba(16,185,129,.1);">🟢 Live</span>
+                            </div>
+                        </div>
+                        <button class="btn btn-primary exam-start-btn" data-exam-id="${e.id}" data-exam-title="${e.title.replace(/"/g,'&quot;')}" data-exam-dur="${e.duration_seconds}" data-exam-qcount="${e.questions_to_show}">
+                            <i class="fa-solid fa-play"></i> Start Exam
+                        </button>
+                    </div>
+                </div>`).join('')}
+            </div>` : ''}
+            ${closed.length ? `<div>
+                <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:var(--text-muted);text-transform:uppercase;margin-bottom:12px;">Past Exams</div>
+                ${closed.map(e=>`<div class="exam-student-card" style="opacity:.8;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                        <div>
+                            <div style="font-weight:600;font-size:15px;">${e.title}</div>
+                            ${e.subject?`<div style="font-size:12px;color:var(--text-muted);">${e.subject}</div>`:''}
+                            <span class="exam-pill" style="margin-top:8px;display:inline-block;">🔴 Closed</span>
+                        </div>
+                        <button class="btn btn-secondary exam-result-btn" data-exam-id="${e.id}" style="font-size:13px;">
+                            <i class="fa-solid fa-chart-bar"></i> My Result
+                        </button>
+                    </div>
+                </div>`).join('')}
+            </div>` : ''}
+        </div>`;
+
+        document.querySelectorAll('.exam-start-btn').forEach(btn=>{
+            btn.addEventListener('click', ()=>showExamStartModal(btn.dataset.examId, btn.dataset.examTitle, btn.dataset.examDur, btn.dataset.examQcount));
+        });
+        document.querySelectorAll('.exam-result-btn').forEach(btn=>{
+            btn.addEventListener('click', ()=>showExamResults(btn.dataset.examId, null, false));
+        });
+    } catch(err) { console.error(err); dynamicContentArea.innerHTML=`<div class="glass-card"><p style="color:var(--danger);">Failed to load exams.</p></div>`; }
+};
+
+function showExamStartModal(examId, examTitle, durationSec, qcount) {
+    const dm = Math.round(parseInt(durationSec)/60);
+    generalModalTitle.textContent = 'Exam Instructions';
+    generalModalBody.innerHTML = `
+    <div style="text-align:center;margin-bottom:20px;">
+        <i class="fa-solid fa-file-pen" style="font-size:40px;color:var(--primary);display:block;margin-bottom:12px;"></i>
+        <div style="font-weight:700;font-size:17px;">${examTitle}</div>
+    </div>
+    <div style="background:var(--bg-secondary);border-radius:12px;padding:16px;margin-bottom:16px;">
+        <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border-color);"><span style="color:var(--text-muted);">Questions</span><strong>${qcount} MCQs</strong></div>
+        <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border-color);"><span style="color:var(--text-muted);">Duration</span><strong>${dm} minutes</strong></div>
+        <div style="display:flex;justify-content:space-between;padding:8px 0;"><span style="color:var(--text-muted);">Marking</span><strong>+1 per correct answer</strong></div>
+    </div>
+    <div style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.2);border-radius:10px;padding:14px;margin-bottom:20px;">
+        <div style="font-weight:700;color:var(--danger);margin-bottom:8px;"><i class="fa-solid fa-triangle-exclamation"></i> Important Rules</div>
+        <ul style="color:var(--text-muted);font-size:13px;padding-left:20px;line-height:1.9;">
+            <li>Do <strong>NOT</strong> switch tabs or minimize this window.</li>
+            <li>Exam will be <strong>auto-submitted instantly</strong> if you switch tabs.</li>
+            <li>Refreshing or re-logging will <strong>resume</strong> your exam from where you left.</li>
+            <li>Timer starts when you click <strong>"Begin Exam"</strong>.</li>
+        </ul>
+    </div>
+    <button class="btn btn-primary" id="exam-begin-btn" style="width:100%;padding:14px;font-size:16px;">
+        <i class="fa-solid fa-play"></i> Begin Exam
+    </button>`;
+    generalModal.classList.add('active');
+    document.getElementById('exam-begin-btn').addEventListener('click', async ()=>{ generalModal.classList.remove('active'); await startOrResumeExam(examId, false); });
+}
+
+async function startOrResumeExam(examId, isResume) {
+    dynamicContentArea.innerHTML = `<div class="text-center" style="padding:50px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:32px;color:var(--primary);"></i><p style="margin-top:16px;color:var(--text-muted);">${isResume?'Resuming your exam...':'Starting exam...'}</p></div>`;
+    try {
+        const r = await fetch('/api/exam-sessions/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({exam_id:examId,student_id:currentUser.id}) });
+        const d = await r.json();
+        if (!d.success) { alert(d.error||'Could not start exam.'); window.renderStudentExam(); return; }
+        if (d.already_submitted) { await showExamResults(examId, d.session.id, d.session.auto_submitted); return; }
+        activeExamSession = d.session;
+        activeExamQuestions = d.questions;
+        activeExamAnswers = JSON.parse(d.session.answers||'{}');
+        activeExamCurrentQ = 0;
+        examAutoSubmitLocked = false;
+        if (isResume && Object.keys(activeExamAnswers).length>0) {
+            const fi = activeExamQuestions.findIndex(q=>!activeExamAnswers[q.id]);
+            activeExamCurrentQ = fi>=0 ? fi : activeExamQuestions.length-1;
+        }
+        renderExamScreen(d.session.time_remaining_seconds || 1800);
+    } catch(err) { console.error(err); alert('Failed to start exam.'); window.renderStudentExam(); }
+}
+
+function renderExamScreen(initialTime) {
+    stopExamTimer();
+    let timeLeft = parseInt(initialTime) || 1800;
+    const totalQ = activeExamQuestions.length;
+    const q = activeExamQuestions[activeExamCurrentQ];
+
+    dynamicContentArea.innerHTML = `
+    <div class="exam-screen-wrapper">
+        <div class="exam-header-bar">
+            <div style="font-weight:700;font-size:15px;"><i class="fa-solid fa-file-pen mr-8" style="color:var(--primary);"></i>MCQ Exam</div>
+            <div style="display:flex;align-items:center;gap:14px;">
+                <div class="exam-progress-label">Q ${activeExamCurrentQ+1} / ${totalQ}</div>
+                <div class="exam-timer" id="exam-countdown">${formatExamTime(timeLeft)}</div>
+                <button class="btn btn-primary" id="exam-submit-final-btn" style="padding:8px 18px;font-size:13px;">
+                    <i class="fa-solid fa-paper-plane"></i> Submit
+                </button>
+            </div>
+        </div>
+        <div class="exam-dots-row" id="exam-dots-row">
+            ${activeExamQuestions.map((qq,i)=>{
+                const answered=activeExamAnswers[qq.id];
+                return `<button class="exam-dot ${answered?'answered':''} ${i===activeExamCurrentQ?'current':''}" data-dot="${i}">${i+1}</button>`;
+            }).join('')}
+        </div>
+        <div class="exam-question-card" id="exam-q-wrapper">${buildQuestionHTML(q, activeExamCurrentQ)}</div>
+        <div class="exam-nav-row">
+            <button class="btn btn-secondary" id="exam-prev-btn" ${activeExamCurrentQ===0?'disabled':''}>
+                <i class="fa-solid fa-arrow-left"></i> Prev
+            </button>
+            <span style="color:var(--text-muted);font-size:13px;" id="exam-answered-count">${Object.keys(activeExamAnswers).length}/${totalQ} Answered</span>
+            <button class="btn btn-primary" id="exam-next-btn" ${activeExamCurrentQ>=totalQ-1?'disabled':''}>
+                Next <i class="fa-solid fa-arrow-right"></i>
+            </button>
+        </div>
+    </div>`;
+
+    // Countdown
+    const timerEl = document.getElementById('exam-countdown');
+    examTimerInterval = setInterval(async ()=>{
+        timeLeft--;
+        if (timerEl) {
+            timerEl.textContent = formatExamTime(timeLeft);
+            timerEl.style.color = timeLeft<60?'var(--danger)':timeLeft<300?'var(--warning)':'var(--accent)';
+            if (timeLeft<=10) timerEl.style.animation='exam-pulse 0.5s infinite';
+        }
+        if (timeLeft%15===0 && activeExamSession) {
+            try { await fetch(`/api/exam-sessions/${activeExamSession.id}/answer`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({time_remaining_seconds:timeLeft})}); } catch(e) {}
+        }
+        if (timeLeft<=0) { stopExamTimer(); await submitExam(false, true); }
+    }, 1000);
+
+    // Options click
+    document.getElementById('exam-q-wrapper').addEventListener('click', async (ev)=>{
+        const opt = ev.target.closest('[data-option]'); if(!opt) return;
+        const qId = parseInt(opt.dataset.qid);
+        const chosen = opt.dataset.option;
+        activeExamAnswers[qId] = chosen;
+        // Update UI
+        document.querySelectorAll(`[data-qid="${qId}"]`).forEach(b=>b.classList.toggle('selected', b.dataset.option===chosen));
+        document.getElementById('exam-answered-count').textContent=`${Object.keys(activeExamAnswers).length}/${totalQ} Answered`;
+        document.querySelectorAll('[data-dot]').forEach((dot,i)=>{ dot.classList.toggle('answered',!!activeExamAnswers[activeExamQuestions[i].id]); });
+        // Heartbeat
+        if (activeExamSession) {
+            try { await fetch(`/api/exam-sessions/${activeExamSession.id}/answer`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question_id:qId,chosen_option:chosen,time_remaining_seconds:timeLeft})}); } catch(e){}
+        }
+    });
+
+    document.getElementById('exam-prev-btn')?.addEventListener('click',()=>{ if(activeExamCurrentQ>0){activeExamCurrentQ--;renderExamScreen(timeLeft);} });
+    document.getElementById('exam-next-btn')?.addEventListener('click',()=>{ if(activeExamCurrentQ<totalQ-1){activeExamCurrentQ++;renderExamScreen(timeLeft);} });
+    document.getElementById('exam-dots-row').addEventListener('click',ev=>{ const d=ev.target.closest('[data-dot]'); if(d){activeExamCurrentQ=parseInt(d.dataset.dot);renderExamScreen(timeLeft);} });
+    document.getElementById('exam-submit-final-btn').addEventListener('click',()=>{
+        const ua = totalQ - Object.keys(activeExamAnswers).length;
+        if(confirm(ua>0?`You have ${ua} unanswered questions. Submit anyway?`:'Submit exam? This cannot be undone.')) submitExam(false,false);
+    });
+}
+
+function buildQuestionHTML(q, idx) {
+    if (!q) return '<p style="color:var(--danger);">Question not found.</p>';
+    const chosen = activeExamAnswers[q.id];
+    return `<div class="exam-q-number">Question ${idx+1}</div>
+    <div class="exam-q-text">${q.question_text}</div>
+    <div class="exam-options-grid">
+        ${['A','B','C','D'].map(k=>`<button class="exam-option ${chosen===k?'selected':''}" data-option="${k}" data-qid="${q.id}">
+            <span class="exam-opt-key">${k}</span>
+            <span class="exam-opt-text">${q['option_'+k.toLowerCase()]}</span>
+        </button>`).join('')}
+    </div>`;
+}
+
+async function submitExam(autoByTab, autoByTimer) {
+    if (!activeExamSession || examAutoSubmitLocked) return;
+    examAutoSubmitLocked = true;
+    stopExamTimer();
+    dynamicContentArea.innerHTML = `<div class="text-center" style="padding:50px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:32px;color:var(--primary);"></i><p style="margin-top:16px;color:var(--text-muted);">Submitting exam...</p></div>`;
+    try {
+        const r = await fetch(`/api/exam-sessions/${activeExamSession.id}/submit`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_submitted:autoByTab||autoByTimer})});
+        const d = await r.json();
+        activeExamSession.status = 'submitted';
+        if (d.success) showExamResultsInline(d.score, d.total, d.breakdown, autoByTab, autoByTimer);
+        else { alert(d.error||'Failed to submit.'); window.renderStudentExam(); }
+    } catch(err) { alert('Network error.'); window.renderStudentExam(); }
+}
+
+async function showExamResults(examId, sessionId, wasAuto) {
+    dynamicContentArea.innerHTML = `<div class="text-center" style="padding:50px;"><i class="fa-solid fa-spinner fa-spin" style="font-size:32px;color:var(--primary);"></i></div>`;
+    try {
+        let sid = sessionId;
+        if (!sid) {
+            const sr = await fetch(`/api/exam-sessions/my?student_id=${currentUser.id}&exam_id=${examId}`);
+            const sd = await sr.json();
+            if (!sd.session) { dynamicContentArea.innerHTML=`<div class="glass-card"><p style="color:var(--text-muted);text-align:center;padding:24px;">No result found for this exam.</p><button class="btn btn-secondary" onclick="window.renderStudentExam()"><i class="fa-solid fa-arrow-left"></i> Back</button></div>`; return; }
+            sid = sd.session.id; wasAuto = sd.session.auto_submitted;
+        }
+        const r = await fetch(`/api/exam-sessions/${sid}/submit`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_submitted:false})});
+        const d = await r.json();
+        showExamResultsInline(d.score, d.total, d.breakdown, wasAuto, false);
+    } catch(e) { dynamicContentArea.innerHTML=`<div class="glass-card"><p style="color:var(--danger);">Failed to load result.</p></div>`; }
+}
+
+function showExamResultsInline(score, total, breakdown, autoByTab, autoByTimer) {
+    activeExamSession = null;
+    const pct = total>0?Math.round(score/total*100):0;
+    const pc = pct>=75?'var(--success)':pct>=50?'var(--warning)':'var(--danger)';
+    const grade = pct>=90?'A+':pct>=75?'A':pct>=60?'B':pct>=50?'C':'F';
+    const autoAlert = autoByTab
+        ? `<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:10px;padding:12px 16px;margin-bottom:20px;color:var(--danger);font-weight:600;font-size:13px;"><i class="fa-solid fa-triangle-exclamation"></i> Exam was auto-submitted because you switched tabs or minimized the window.</div>`
+        : autoByTimer ? `<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:12px 16px;margin-bottom:20px;color:var(--warning);font-weight:600;font-size:13px;"><i class="fa-solid fa-clock"></i> Time's up! Exam was auto-submitted.</div>` : '';
+
+    dynamicContentArea.innerHTML = `
+    <div class="glass-card mb-20" style="text-align:center;">
+        ${autoAlert}
+        <div class="exam-score-ring" style="--score-color:${pc};">
+            <div class="exam-score-inner">
+                <div style="font-size:36px;font-weight:800;color:${pc};">${score}</div>
+                <div style="font-size:14px;color:var(--text-muted);">out of ${total}</div>
+                <div style="font-size:22px;font-weight:800;color:${pc};margin-top:4px;">${grade}</div>
+            </div>
+        </div>
+        <div style="display:flex;justify-content:center;gap:28px;flex-wrap:wrap;margin:20px 0 8px;">
+            <div><div style="font-size:28px;font-weight:800;color:${pc};">${pct}%</div><div style="font-size:11px;color:var(--text-muted);">Score</div></div>
+            <div><div style="font-size:28px;font-weight:800;color:var(--success);">${score}</div><div style="font-size:11px;color:var(--text-muted);">Correct</div></div>
+            <div><div style="font-size:28px;font-weight:800;color:var(--danger);">${total-score}</div><div style="font-size:11px;color:var(--text-muted);">Wrong/Skipped</div></div>
+        </div>
+        <button class="btn btn-secondary" id="exam-back-btn" style="margin-top:16px;"><i class="fa-solid fa-arrow-left"></i> Back to Exams</button>
+    </div>
+    <div class="glass-card">
+        <h3 class="card-title mb-16"><i class="fa-solid fa-list-check mr-8" style="color:var(--primary);"></i>Answer Breakdown</h3>
+        <div style="display:flex;flex-direction:column;gap:14px;">
+            ${(breakdown||[]).map(b=>{
+                const correct=b.is_correct; const skipped=!b.chosen_answer;
+                return `<div class="exam-breakdown-card ${correct?'correct':skipped?'skipped':'wrong'}">
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+                        <div style="font-weight:600;font-size:14px;flex:1;padding-right:12px;">Q${b.index}. ${b.question_text}</div>
+                        <div>${correct?`<span class="exam-pill" style="color:var(--success);background:rgba(16,185,129,.1);">✅ Correct</span>`:skipped?`<span class="exam-pill" style="color:var(--text-muted);background:rgba(255,255,255,.05);">⏭ Skipped</span>`:`<span class="exam-pill" style="color:var(--danger);background:rgba(239,68,68,.1);">❌ Wrong</span>`}</div>
+                    </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+                        ${['A','B','C','D'].map(k=>{
+                            const ot = b['option_'+k.toLowerCase()];
+                            const isChosen=b.chosen_answer===k; const isAns=b.correct_answer===k;
+                            let st='background:var(--bg-secondary);border:1px solid var(--border-color);';
+                            if(isAns) st='background:rgba(16,185,129,.12);border:1.5px solid rgba(16,185,129,.4);color:var(--success);font-weight:600;';
+                            else if(isChosen&&!isAns) st='background:rgba(239,68,68,.08);border:1.5px solid rgba(239,68,68,.3);color:var(--danger);';
+                            return `<div style="${st}padding:8px 10px;border-radius:8px;font-size:12px;"><span style="font-weight:700;margin-right:6px;">${k}.</span>${ot}${isAns?' ✅':''}${isChosen&&!isAns?' ❌':''}</div>`;
+                        }).join('')}
+                    </div>
+                </div>`;
+            }).join('')}
+        </div>
+    </div>`;
+    document.getElementById('exam-back-btn').addEventListener('click', ()=>window.renderStudentExam());
+}
